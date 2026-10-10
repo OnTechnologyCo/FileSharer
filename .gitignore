@@ -1,0 +1,40 @@
+# Local duplicate and historical working folders
+/FileSharer/
+/_archive_*/
+/README_소스코드설명.txt
+/System.Drawing.Drawing2D.GraphicsPath
+**/.llmtools-attachments/
+
+# Live settings, share data, access logs and tunnel state
+**/settings*.txt*
+**/shares_db*.txt*
+**/access_log*.txt*
+**/uploads/
+**/fstsnet-state*/
+**/tsnet-state*/
+**/tailscale.state
+
+# Build outputs and local backups
+dist/
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.gz
+*.log
+*.bak
+*.tmp
+*.mcp-backup-*
+
+# Credentials and local development files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+.vs/
+.vscode/

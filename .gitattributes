@@ -1,0 +1,2 @@
+# Preserve the existing source bytes across Windows checkouts.
+* -text
