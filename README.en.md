@@ -25,7 +25,7 @@ A C# Windows Forms application for sharing files and folders through links. It s
 
 ## Build
 
-Use Windows with the .NET Framework 4.x C# compiler and Go installed. `tsproxy/go.mod` declares **Go 1.26.6**. Go can download the required version when automatic toolchain selection is enabled. The first build may require internet access to download the toolchain and dependencies.
+Use Windows with the .NET Framework 4.x C# compiler and Go installed. `tsproxy/go.mod` declares **Go 1.26.10**. Go can download the required version when automatic toolchain selection is enabled. The first build may require internet access to download the toolchain and dependencies.
 
 Open PowerShell in the project directory and run:
 
@@ -43,6 +43,14 @@ Outputs are written to `dist/`. `FileSharer.exe` embeds the compressed Go helper
 4. For external sharing, configure the selected connection method. The Tailscale option requires a valid authentication key and an account configured to allow Funnel.
 
 External sharing makes the share address reachable from the internet. Review the shared content and access settings, and revoke links when finished. Keep authentication keys and actual access logs out of the repository.
+
+## Download limits and resumption
+
+Starting one file or folder ZIP consumes one download. Individual files in a folder share that same limit. HEAD does not consume a download. A server-issued grant resumes the same file version without another charge. Browsers use the response cookie; API clients can forward `X-Download-Token` on subsequent Range requests.
+
+Grants last up to 24 hours and become invalid on share expiry/revocation, file changes, or server restart. An already authorized response may finish after expiry, but new requests are denied. Multipart Range headers return 416. See the [policy and validation record](docs/security-validation-2026-10-31.md).
+
+Run `powershell -File tests/run-security.ps1` and `node tests/browser-resume.cjs`. After building, `powershell -File tests/verify-package.ps1` verifies the embedded Go version and cached-helper replacement.
 
 ## Public repository contents
 

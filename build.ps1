@@ -19,12 +19,29 @@ if ($outDir.TrimEnd('\') -eq $root.TrimEnd('\')) {
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 $helper = Join-Path $outDir 'tsproxy.exe'
+$savedGoEnv = @{}
+foreach ($key in @('GOTOOLCHAIN', 'GOOS', 'GOARCH', 'CGO_ENABLED')) {
+    $savedGoEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+}
 Push-Location (Join-Path $root 'tsproxy')
 try {
+    # Pin the production compiler, including when a developer has an older Go installed.
+    $env:GOTOOLCHAIN = 'go1.26.10'
+    $env:GOOS = 'windows'
+    $env:GOARCH = 'amd64'
+    $env:CGO_ENABLED = '0'
     & $goCommand.Source build -mod=readonly -trimpath -ldflags '-s -w' -o $helper .
     if ($LASTEXITCODE -ne 0) { throw 'The Go helper build failed.' }
+    $buildInfo = & $goCommand.Source version -m $helper
+    if ($LASTEXITCODE -ne 0 -or $buildInfo[0] -notmatch '\bgo1\.26\.10$') {
+        throw 'The packaged helper was not built with the approved Go 1.26.10 toolchain.'
+    }
+    $buildInfo | Set-Content -Encoding UTF8 (Join-Path $outDir 'tsproxy-build-info.txt')
 } finally {
     Pop-Location
+    foreach ($key in $savedGoEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $savedGoEnv[$key], 'Process')
+    }
 }
 
 $compressedHelper = Join-Path $outDir 'tsproxy.exe.gz'
