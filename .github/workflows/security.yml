@@ -1,0 +1,45 @@
+name: Download security and package
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: tsproxy/go.sum
+      - name: HTTP security regressions
+        shell: powershell
+        run: ./tests/run-security.ps1
+      - name: Browser retry logic
+        run: node tests/browser-resume.cjs
+      - name: Test helper and scan Windows symbols
+        shell: powershell
+        working-directory: tsproxy
+        env:
+          GOTOOLCHAIN: go1.26.10
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          govulncheck -scan=symbol ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build installer with embedded patched helper
+        shell: powershell
+        run: ./build.ps1
+      - name: Verify embedded helper and upgrade cache
+        shell: powershell
+        run: ./tests/verify-package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FileSharer-windows-security-build
+          path: |
+            dist/FileSharer.exe
+            dist/FileSharer_Setup.exe
+            dist/tsproxy-build-info.txt

@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("File Sharer 설치 관리자")]
 [assembly: AssemblyProduct("Local & External File Sharer")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
 
 namespace FileSharerSetup
 {
@@ -26,7 +26,7 @@ namespace FileSharerSetup
     {
         public const string ProductName = "Local & External File Sharer";
         public const string ShortName = "File Sharer";
-        public const string Version = "1.1.0";
+        public const string Version = "1.1.1";
         public const string Publisher = "FileSharer";
         public const string ExeName = "FileSharer.exe";
         public const string IconName = "filesharer.ico";

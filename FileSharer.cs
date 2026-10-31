@@ -43,7 +43,7 @@ namespace LocalFileSharer
         public bool IsActive()
         {
             if (IsRevoked) return false;
-            if (ExpiresAt.HasValue && DateTime.Now > ExpiresAt.Value) return false;
+            if (ExpiresAt.HasValue && DateTime.Now >= ExpiresAt.Value) return false;
             if (MaxDownloads.HasValue && DownloadCount >= MaxDownloads.Value) return false;
             return true;
         }
@@ -1849,7 +1849,7 @@ namespace LocalFileSharer
 
         /// <summary>
         /// exe 안에 gzip 으로 들어 있는 tsproxy 를 임시 폴더에 푼다.
-        /// 이미 같은 크기로 풀려 있으면 그대로 쓴다(매번 8MB 를 다시 풀 이유가 없다).
+        /// 이미 같은 SHA-256으로 풀려 있으면 그대로 쓴다(매번 8MB 를 다시 풀 이유가 없다).
         /// </summary>
         private static string ExtractProxy()
         {
@@ -1882,7 +1882,14 @@ namespace LocalFileSharer
 
                     // 이미 같은 것이 풀려 있으면 다시 쓰지 않는다 (실행 중이면 덮어쓸 수도 없다).
                     if (File.Exists(exePath) && new FileInfo(exePath).Length == raw.Length)
-                        return exePath;
+                    {
+                        using (SHA256 hash = SHA256.Create())
+                        using (FileStream existing = File.OpenRead(exePath))
+                        {
+                            if (Convert.ToBase64String(hash.ComputeHash(existing)) ==
+                                Convert.ToBase64String(hash.ComputeHash(raw))) return exePath;
+                        }
+                    }
 
                     string tmp = exePath + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
                     File.WriteAllBytes(tmp, raw);
@@ -2658,7 +2665,7 @@ namespace LocalFileSharer
             catch { }
         }
 
-        private static void SaveStoreToDisk()
+        private static bool SaveStoreToDisk()
         {
             try
             {
@@ -2687,10 +2694,11 @@ namespace LocalFileSharer
                         });
                         lines.Add(line);
                     }
+                    WriteFileAtomic(DbPath, lines.ToArray());
                 }
-                WriteFileAtomic(DbPath, lines.ToArray());
+                return true;
             }
-            catch { }
+            catch { return false; }
         }
 
         /// <summary>
@@ -3019,11 +3027,13 @@ namespace LocalFileSharer
             cmbMaxDl = new ComboBox();
             cmbMaxDl.Font = fontInput;
             cmbMaxDl.DropDownStyle = ComboBoxStyle.DropDownList;
-            cmbMaxDl.Items.AddRange(new string[] { "제한 없음 (무제한)", "1회 전용 (1회 다운로드 시 파기)", "최대 5회", "최대 10회" });
+            cmbMaxDl.Items.AddRange(new string[] { "제한 없음 (무제한)", "1회 (ZIP/개별 파일 각각 차감)", "최대 5회", "최대 10회" });
             cmbMaxDl.SelectedIndex = 0; // Default to 제한 없음
             cmbMaxDl.Location = new Point(240, 158);
             cmbMaxDl.Size = new Size(200, 28);
             leftPanel.Controls.Add(cmbMaxDl);
+            new ToolTip().SetToolTip(cmbMaxDl,
+                "ZIP 1건 또는 개별 파일 1개를 시작할 때 1회 차감합니다. 승인된 이어받기와 HEAD는 추가 차감하지 않습니다.");
 
             Label lblPass = new Label();
             lblPass.Text = "🔒 비밀번호 보호 (외부망 공유 시 권장)";
@@ -4036,6 +4046,10 @@ namespace LocalFileSharer
                 {
                     item.IsRevoked = true;
                     store.Remove(id);
+                    List<string> revokedGrants = new List<string>();
+                    foreach (var grant in downloadGrants)
+                        if (object.ReferenceEquals(grant.Value.Item, item)) revokedGrants.Add(grant.Key);
+                    foreach (string token in revokedGrants) downloadGrants.Remove(token);
                 }
             }
 
@@ -4622,6 +4636,136 @@ namespace LocalFileSharer
             }
         }
 
+        private sealed class DownloadGrant
+        {
+            public ShareItem Item;
+            public string Path;
+            public long Length, LastWriteTicks;
+            public bool Encrypted;
+            public DateTime UntilUtc;
+        }
+
+        // Protected by storeLock, together with the share quota. Grants intentionally do not
+        // survive a restart; existing share settings/PINs/counts retain their on-disk format.
+        private static readonly Dictionary<string, DownloadGrant> downloadGrants =
+            new Dictionary<string, DownloadGrant>(StringComparer.Ordinal);
+
+        private static string CheckShareLocked(string id, string pin, bool checkQuota, out ShareItem item)
+        {
+            item = null;
+            if (string.IsNullOrEmpty(id) || !store.TryGetValue(id, out item)) return "404 Not Found";
+            if (item.IsRevoked || (item.ExpiresAt.HasValue && DateTime.Now >= item.ExpiresAt.Value))
+                return "410 Gone";
+            if (!string.IsNullOrEmpty(item.Password) && item.Password != pin) return "403 Forbidden";
+            if (checkQuota && item.MaxDownloads.HasValue && item.DownloadCount >= item.MaxDownloads.Value)
+                return "410 Gone";
+            return null;
+        }
+
+        private static void SendPolicyError(NetworkStream stream, string status, bool isHead)
+        {
+            SendResponse(stream, status, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes(status), isHead);
+        }
+
+        private static void SendShareError(NetworkStream stream, string status, bool isHead,
+            string id, string clientIp, string socketIp, string userAgent)
+        {
+            AccessLogger.Log(clientIp, socketIp, status == "403 Forbidden" ? AccessLogger.ActPinFail : AccessLogger.ActBlocked,
+                id, id, userAgent, status);
+            SendPolicyError(stream, status, isHead);
+        }
+
+        private static string ResolveSubfile(ShareItem item, string relative)
+        {
+            try
+            {
+                if (!item.IsFolder || string.IsNullOrEmpty(relative) || Path.IsPathRooted(relative)) return null;
+                string root = Path.GetFullPath(item.FilePath).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+                string full = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+                if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) return null;
+                // Junctions/symlinks must not turn a lexically contained path into an outside file.
+                for (string p = full; p.Length >= root.TrimEnd('\\', '/').Length; p = Path.GetDirectoryName(p))
+                {
+                    if ((File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0) return null;
+                    if (string.Equals(p.TrimEnd('\\', '/'), root.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)) break;
+                }
+                return full;
+            }
+            catch { return null; }
+        }
+
+        private static string GrantCookieName(string shareId, string filePath, bool encrypted)
+        {
+            using (SHA256 hash = SHA256.Create())
+            {
+                byte[] digest = hash.ComputeHash(Encoding.UTF8.GetBytes(shareId + "\n" + filePath.ToUpperInvariant() + "\n" + encrypted));
+                return "fsdl_" + BitConverter.ToString(digest, 0, 16).Replace("-", "");
+            }
+        }
+
+        private static string AuthorizeDownload(ShareItem expected, string pin, FileInfo file, bool encrypted,
+            string[] headers, bool isHead, bool isRange, out string token, out string cookieName)
+        {
+            token = null;
+            cookieName = GrantCookieName(expected.Id, file.FullName, encrypted);
+            string supplied = GetHeader(headers, "X-Download-Token");
+            // Ordinary GET always starts a new download, even if the browser has an old cookie.
+            if (string.IsNullOrEmpty(supplied) && (isRange || isHead))
+            {
+                foreach (string cookie in GetHeader(headers, "Cookie").Split(';'))
+                {
+                    string c = cookie.Trim();
+                    if (c.StartsWith(cookieName + "=", StringComparison.Ordinal))
+                    { supplied = c.Substring(cookieName.Length + 1); break; }
+                }
+            }
+            lock (storeLock)
+            {
+                ShareItem current;
+                string error = CheckShareLocked(expected.Id, pin, false, out current);
+                if (error != null) return error;
+                if (!object.ReferenceEquals(expected, current)) return "410 Gone";
+                if (!string.IsNullOrEmpty(supplied))
+                {
+                    DownloadGrant grant;
+                    if ((!isRange && !isHead) || !downloadGrants.TryGetValue(supplied, out grant) ||
+                        !object.ReferenceEquals(grant.Item, current) || grant.UntilUtc <= DateTime.UtcNow ||
+                        !string.Equals(grant.Path, file.FullName, StringComparison.OrdinalIgnoreCase) ||
+                        grant.Length != file.Length || grant.LastWriteTicks != file.LastWriteTimeUtc.Ticks ||
+                        grant.Encrypted != encrypted) return "403 Forbidden";
+                    token = supplied;
+                    return null;
+                }
+                error = CheckShareLocked(expected.Id, pin, true, out current);
+                if (error != null || isHead) return error;
+
+                List<string> stale = new List<string>();
+                foreach (var entry in downloadGrants)
+                {
+                    DownloadGrant g = entry.Value;
+                    if (g.UntilUtc <= DateTime.UtcNow || g.Item.IsRevoked ||
+                        (g.Item.ExpiresAt.HasValue && DateTime.Now >= g.Item.ExpiresAt.Value)) stale.Add(entry.Key);
+                }
+                foreach (string key in stale) downloadGrants.Remove(key);
+                if (downloadGrants.Count >= 4096) return "503 Service Unavailable";
+                byte[] random = new byte[32];
+                using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) { rng.GetBytes(random); }
+                token = ShareCrypto.ToBase64Url(random);
+                downloadGrants.Add(token, new DownloadGrant { Item = current, Path = file.FullName,
+                    Length = file.Length, LastWriteTicks = file.LastWriteTimeUtc.Ticks, Encrypted = encrypted,
+                    UntilUtc = DateTime.UtcNow.AddHours(24) });
+                current.DownloadCount++;
+                if (!SaveStoreToDisk())
+                {
+                    current.DownloadCount--;
+                    downloadGrants.Remove(token);
+                    token = null;
+                    return "503 Service Unavailable";
+                }
+                return null;
+            }
+        }
+
         private static void ProcessClient(TcpClient client)
         {
             using (client)
@@ -4712,6 +4856,12 @@ namespace LocalFileSharer
                     return;
                 }
 
+                if (method != "GET" && !isHead)
+                {
+                    SendPolicyError(stream, "405 Method Not Allowed", false);
+                    return;
+                }
+
                 if (path == "/api/network-info")
                 {
                     string json = string.Format("{{\"ip\":\"{0}\",\"port\":{1},\"baseUrl\":\"http://{0}:{1}\"}}", localIp, Port);
@@ -4736,55 +4886,20 @@ namespace LocalFileSharer
 
                     id = id.Trim('/', ' ', '\t', '\r', '\n');
 
-                    ShareItem item = null;
-                    lock (storeLock)
+                    ShareItem item;
+                    string policy;
+                    lock (storeLock) { policy = CheckShareLocked(id, queryPin, true, out item); }
+                    if (policy == "403 Forbidden")
                     {
-                        if (!string.IsNullOrEmpty(id) && store.ContainsKey(id)) item = store[id];
-                    }
-
-                    if (item == null)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActNotFound, "-", id, userAgent, "존재하지 않는 공유 ID 접근");
-                        byte[] errB = Encoding.UTF8.GetBytes("<html><head><meta charset='utf-8'></head><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px;'><h2>공유 링크를 찾을 수 없습니다</h2><p>해당 공유 ID의 파일/폴더 정보가 존재하지 않거나 프로그램이 재시작되었습니다.<br>공유 링크를 새로 생성해 주세요.</p></body></html>");
-                        SendResponse(stream, "404 Not Found", "text/html; charset=utf-8", errB);
+                        AccessLogger.Log(clientIp, socketIp, queryPin == "" ? AccessLogger.ActPinPrompt : AccessLogger.ActPinFail,
+                            item.OriginalName, id, userAgent, "PIN required");
+                        SendResponse(stream, "200 OK", "text/html; charset=utf-8",
+                            Encoding.UTF8.GetBytes(BuildPinInputHtml(item, id, queryPin != "")), isHead);
                         return;
                     }
-
-                    if (item.IsRevoked)
+                    if (policy != null)
                     {
-                        ZipCache.Purge(id);
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "게시자가 해제한 링크");
-                        byte[] errB = Encoding.UTF8.GetBytes("<html><head><meta charset='utf-8'></head><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px;'><h2>공유가 해제되었습니다</h2><p>게시자에 의해 수동으로 해제된 링크입니다.</p></body></html>");
-                        SendResponse(stream, "410 Gone", "text/html; charset=utf-8", errB);
-                        return;
-                    }
-
-                    if (item.ExpiresAt.HasValue && DateTime.Now > item.ExpiresAt.Value)
-                    {
-                        ZipCache.Purge(id);
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "만료된 링크 접근");
-                        string msg = string.Format("<html><head><meta charset='utf-8'></head><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px;'><h2>공유 시간 만료</h2><p>설정된 만료 시간({0})이 경과되었습니다.</p></body></html>", item.ExpiresAt.Value.ToString("yyyy-MM-dd HH:mm"));
-                        SendResponse(stream, "410 Gone", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(msg));
-                        return;
-                    }
-
-                    if (item.MaxDownloads.HasValue && item.DownloadCount >= item.MaxDownloads.Value)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "다운로드 횟수 초과");
-                        string msg = string.Format("<html><head><meta charset='utf-8'></head><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px;'><h2>다운로드 횟수 초과</h2><p>최대 다운로드 허용 횟수({0}회)를 초과하였습니다.</p></body></html>", item.MaxDownloads.Value);
-                        SendResponse(stream, "410 Gone", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(msg));
-                        return;
-                    }
-
-                    // Check password if configured
-                    if (!string.IsNullOrEmpty(item.Password) && queryPin != item.Password)
-                    {
-                        AccessLogger.Log(clientIp, socketIp,
-                            queryPin != "" ? AccessLogger.ActPinFail : AccessLogger.ActPinPrompt,
-                            item.OriginalName, id, userAgent,
-                            queryPin != "" ? "잘못된 비밀번호 입력" : "비밀번호 입력 화면 표시");
-                        string pinHtml = BuildPinInputHtml(item, id, queryPin != "");
-                        SendResponse(stream, "200 OK", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(pinHtml));
+                        SendShareError(stream, policy, isHead, id, clientIp, socketIp, userAgent);
                         return;
                     }
 
@@ -4800,7 +4915,7 @@ namespace LocalFileSharer
                     string html = viaTunnel
                         ? BuildEncryptedDownloadHtml(item, queryPin)
                         : BuildDownloadHtml(item, queryPin);
-                    SendResponse(stream, "200 OK", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html));
+                    SendResponse(stream, "200 OK", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html), isHead);
                     return;
                 }
 
@@ -4813,37 +4928,14 @@ namespace LocalFileSharer
                     string relPath = query["file"];
                     string pin = query["pin"] ?? "";
 
-                    ShareItem item = null;
-                    lock (storeLock)
+                    ShareItem item;
+                    string policy;
+                    lock (storeLock) { policy = CheckShareLocked(id, pin, false, out item); }
+                    if (policy != null) { SendShareError(stream, policy, isHead, id, clientIp, socketIp, userAgent); return; }
+                    string fullSubPath = ResolveSubfile(item, relPath);
+                    if (fullSubPath == null)
                     {
-                        if (!string.IsNullOrEmpty(id) && store.ContainsKey(id)) item = store[id];
-                    }
-
-                    if (item == null || !item.IsFolder || !Directory.Exists(item.FilePath))
-                    {
-                        SendResponse(stream, "404 Not Found", "text/plain", Encoding.UTF8.GetBytes("Folder Not Found"));
-                        return;
-                    }
-
-                    if (!string.IsNullOrEmpty(item.Password) && pin != item.Password)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActPinFail, relPath, id, userAgent, "개별 파일 다운로드 비밀번호 불일치");
-                        SendResponse(stream, "403 Forbidden", "text/plain", Encoding.UTF8.GetBytes("Invalid Password"));
-                        return;
-                    }
-
-                    // Path.Combine 은 ".." 를 정규화하지 않으므로 GetFullPath 로 펼친 뒤에 검사해야
-                    // 공유 폴더 바깥(예: file=../../secret.txt)을 읽어 가는 것을 막을 수 있다.
-                    string subRoot = Path.GetFullPath(item.FilePath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                    string fullSubPath;
-                    try { fullSubPath = Path.GetFullPath(Path.Combine(subRoot, relPath.Replace('/', Path.DirectorySeparatorChar))); }
-                    catch { fullSubPath = null; }
-
-                    if (fullSubPath == null ||
-                        !fullSubPath.StartsWith(subRoot, StringComparison.OrdinalIgnoreCase) ||
-                        !File.Exists(fullSubPath))
-                    {
-                        SendResponse(stream, "404 Not Found", "text/plain", Encoding.UTF8.GetBytes("File Not Found"));
+                        SendPolicyError(stream, "404 Not Found", isHead);
                         return;
                     }
 
@@ -4851,7 +4943,7 @@ namespace LocalFileSharer
                     ServeFile(stream, lines, isHead, fullSubPath, subInfo.Name, GetMimeType(subInfo.Extension),
                         clientIp, socketIp, id, userAgent, AccessLogger.ActDownSub,
                         string.Format("{0} / 원본: {1}", FormatBytes(subInfo.Length), item.OriginalName),
-                        viaTunnel ? item.EncKey : null);
+                        viaTunnel ? item.EncKey : null, item, pin);
                     return;
                 }
 
@@ -4873,70 +4965,10 @@ namespace LocalFileSharer
 
                     id = id.Trim('/', ' ', '\t', '\r', '\n');
 
-                    ShareItem item = null;
-                    lock (storeLock)
-                    {
-                        if (!string.IsNullOrEmpty(id) && store.ContainsKey(id))
-                        {
-                            item = store[id];
-                        }
-                    }
-
-                    if (item == null)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActNotFound, "-", id, userAgent, "존재하지 않는 공유 ID 다운로드 시도");
-                        SendResponse(stream, "404 Not Found", "text/plain", Encoding.UTF8.GetBytes("Not Found"));
-                        return;
-                    }
-
-                    if (!string.IsNullOrEmpty(item.Password) && pin != item.Password)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActPinFail, item.OriginalName, id, userAgent, "다운로드 비밀번호 불일치");
-                        SendResponse(stream, "403 Forbidden", "text/plain", Encoding.UTF8.GetBytes("Invalid Password"));
-                        return;
-                    }
-
-                    // 해제/만료 검사는 예전에 /d/ 페이지에만 있었다. 그래서 이 API 주소를
-                    // 직접 부르면 해제한 공유도 계속 받아 갈 수 있었다. 여기서도 막는다.
-                    // 다만 이어받기(Range)는 이미 시작한 다운로드의 연장이므로
-                    // 횟수 초과만으로는 끊지 않는다.
-                    bool resuming = !string.IsNullOrEmpty(GetHeader(lines, "Range"));
-
-                    if (item.IsRevoked)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "해제된 공유 다운로드 시도");
-                        SendResponse(stream, "410 Gone", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("공유가 해제되었습니다."));
-                        return;
-                    }
-
-                    if (item.ExpiresAt.HasValue && DateTime.Now > item.ExpiresAt.Value)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "만료된 공유 다운로드 시도");
-                        SendResponse(stream, "410 Gone", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("공유 기간이 만료되었습니다."));
-                        return;
-                    }
-
-                    if (!resuming && item.MaxDownloads.HasValue && item.DownloadCount >= item.MaxDownloads.Value)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActBlocked, item.OriginalName, id, userAgent, "다운로드 횟수 초과");
-                        SendResponse(stream, "410 Gone", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("다운로드 허용 횟수를 초과했습니다."));
-                        return;
-                    }
-
-                    // 끊긴 다운로드를 이어받는 Range 요청은 새 다운로드가 아니다.
-                    // 이것까지 세면 "최대 N회" 링크가 재개 시도 몇 번에 소진되어 파일을 끝내 못 받는다.
-                    bool isResume = !string.IsNullOrEmpty(GetHeader(lines, "Range"));
-                    if (!isResume && !isHead)
-                    {
-                        lock (storeLock)
-                        {
-                            if (item.IsActive())
-                            {
-                                item.DownloadCount++;
-                                SaveStoreToDisk();
-                            }
-                        }
-                    }
+                    ShareItem item;
+                    string policy;
+                    lock (storeLock) { policy = CheckShareLocked(id, pin, false, out item); }
+                    if (policy != null) { SendShareError(stream, policy, isHead, id, clientIp, socketIp, userAgent); return; }
 
                     if (item.IsFolder)
                     {
@@ -4967,7 +4999,7 @@ namespace LocalFileSharer
                         ServeFile(stream, lines, isHead, tempZip, zipName, "application/zip",
                             clientIp, socketIp, id, userAgent, AccessLogger.ActDownZip,
                             string.Format("하위 {0}개 파일 ZIP 전송 (누적 {1}회)", item.FileCount, item.DownloadCount),
-                            viaTunnel ? item.EncKey : null);
+                            viaTunnel ? item.EncKey : null, item, pin);
                         return;
                     }
                     else
@@ -4981,7 +5013,7 @@ namespace LocalFileSharer
                         ServeFile(stream, lines, isHead, item.FilePath, item.OriginalName, item.MimeType,
                             clientIp, socketIp, id, userAgent, AccessLogger.ActDownFile,
                             string.Format("누적 {0}회", item.DownloadCount),
-                            viaTunnel ? item.EncKey : null);
+                            viaTunnel ? item.EncKey : null, item, pin);
                         return;
                     }
                 }
@@ -5148,8 +5180,7 @@ namespace LocalFileSharer
 
         /// <summary>
         /// "Range: bytes=0-1023" / "bytes=1024-" / "bytes=-500" 을 해석한다.
-        /// 여러 구간(멀티파트 Range)은 첫 구간만 쓴다 — 브라우저와 흔한 다운로드 매니저는
-        /// 모두 한 번에 한 구간씩만 요청한다.
+        /// 여러 구간(멀티파트 Range)은 416으로 거절한다. 승인된 개별 구간은 병렬 요청할 수 있다.
         /// </summary>
         private static bool TryParseRange(string header, long total, out long start, out long end)
         {
@@ -5167,7 +5198,7 @@ namespace LocalFileSharer
             v = v.Substring(1).Trim();
 
             int comma = v.IndexOf(',');
-            if (comma >= 0) v = v.Substring(0, comma).Trim();
+            if (comma >= 0) return false; // Multipart ranges are deliberately unsupported.
 
             int dash = v.IndexOf('-');
             if (dash < 0) return false;
@@ -5235,7 +5266,7 @@ namespace LocalFileSharer
         private static void ServeFile(NetworkStream stream, string[] reqLines, bool isHead,
                                       string physicalPath, string downloadName, string contentType,
                                       string clientIp, string socketIp, string shareId, string userAgent,
-                                      string logAction, string logDetail, string encKeyB64)
+                                      string logAction, string logDetail, string encKeyB64, ShareItem expectedItem, string pin)
         {
             FileInfo fi;
             try { fi = new FileInfo(physicalPath); }
@@ -5247,157 +5278,176 @@ namespace LocalFileSharer
                 return;
             }
 
-            long total = fi.Length;
-            long start = 0;
-            long end = total - 1;
-            bool partial = false;
-
-            string rangeHeader = GetHeader(reqLines, "Range");
-            if (!string.IsNullOrEmpty(rangeHeader))
+            FileStream fs;
+            try
             {
-                if (TryParseRange(rangeHeader, total, out start, out end))
+                fs = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    TransferChunkSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
+            }
+            catch (IOException) { SendPolicyError(stream, "409 Conflict", isHead); return; }
+            catch (UnauthorizedAccessException) { SendPolicyError(stream, "403 Forbidden", isHead); return; }
+            using (fs)
+            {
+                fi.Refresh();
+                long total = fs.Length;
+                long start = 0;
+                long end = total - 1;
+                bool partial = false;
+
+                string rangeHeader = GetHeader(reqLines, "Range");
+                if (!string.IsNullOrEmpty(rangeHeader))
                 {
-                    partial = true;
+                    if (TryParseRange(rangeHeader, total, out start, out end))
+                    {
+                        partial = true;
+                    }
+                    else
+                    {
+                        string h416 = string.Format(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{0}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            total);
+                        byte[] b416 = Encoding.ASCII.GetBytes(h416);
+                        try { stream.Write(b416, 0, b416.Length); }
+                        catch { }
+                        return;
+                    }
+                }
+
+                string grantToken, cookieName;
+                string denial = AuthorizeDownload(expectedItem, pin, fi, encKeyB64 != null,
+                    reqLines, isHead, partial, out grantToken, out cookieName);
+                if (denial != null) { SendShareError(stream, denial, isHead, shareId, clientIp, socketIp, userAgent); return; }
+
+                long length = end - start + 1;
+
+                // 암호화 경로면 바이트를 내보내기 직전에 CTR 로 감싼다.
+                // 크기가 변하지 않으므로 Content-Length 도 Range 계산도 그대로 쓸 수 있다.
+                byte[] encKey = string.IsNullOrEmpty(encKeyB64) ? null : ShareCrypto.FromBase64Url(encKeyB64);
+                byte[] encNonce = null;
+                string wireName = downloadName;
+                string wireType = contentType;
+
+                if (encKey != null && encKey.Length == 32)
+                {
+                    encNonce = ShareCrypto.DeriveNonce("body", shareId, downloadName, total, fi.LastWriteTimeUtc.Ticks);
+
+                    // 진짜 이름과 확장자는 헤더에 싣지 않는다. 터널 업체가 보는 것은 불투명한 이름뿐이고,
+                    // 실제 이름은 공유 페이지의 암호화된 메타데이터에만 들어 있다.
+                    wireName = shareId + ".fsenc";
+                    wireType = "application/octet-stream";
                 }
                 else
                 {
-                    string h416 = string.Format(
-                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{0}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                        total);
-                    byte[] b416 = Encoding.ASCII.GetBytes(h416);
-                    try { stream.Write(b416, 0, b416.Length); }
-                    catch { }
-                    return;
+                    encKey = null;
                 }
-            }
 
-            long length = end - start + 1;
-
-            // 암호화 경로면 바이트를 내보내기 직전에 CTR 로 감싼다.
-            // 크기가 변하지 않으므로 Content-Length 도 Range 계산도 그대로 쓸 수 있다.
-            byte[] encKey = string.IsNullOrEmpty(encKeyB64) ? null : ShareCrypto.FromBase64Url(encKeyB64);
-            byte[] encNonce = null;
-            string wireName = downloadName;
-            string wireType = contentType;
-
-            if (encKey != null && encKey.Length == 32)
-            {
-                encNonce = ShareCrypto.DeriveNonce("body", shareId, downloadName, total, fi.LastWriteTimeUtc.Ticks);
-
-                // 진짜 이름과 확장자는 헤더에 싣지 않는다. 터널 업체가 보는 것은 불투명한 이름뿐이고,
-                // 실제 이름은 공유 페이지의 암호화된 메타데이터에만 들어 있다.
-                wireName = shareId + ".fsenc";
-                wireType = "application/octet-stream";
-            }
-            else
-            {
-                encKey = null;
-            }
-
-            StringBuilder hb = new StringBuilder();
-            hb.Append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
-            hb.AppendFormat("Content-Type: {0}\r\n", wireType);
-            hb.AppendFormat("Content-Length: {0}\r\n", length);
-            hb.Append("Accept-Ranges: bytes\r\n");
-            if (partial) hb.AppendFormat("Content-Range: bytes {0}-{1}/{2}\r\n", start, end, total);
-            // 헤더에 방식 이름은 싣지 않는다. 클라이언트가 필요로 하는 값만 중립적인 이름으로 준다.
-            if (encKey != null)
-            {
-                hb.AppendFormat("X-Stream-Id: {0}\r\n", ShareCrypto.ToBase64Url(encNonce));
-            }
-            hb.AppendFormat("Content-Disposition: attachment; filename=\"{0}\"; filename*=UTF-8''{1}\r\n",
-                MakeHeaderSafeName(wireName), Uri.EscapeDataString(wireName));
-            hb.AppendFormat("Last-Modified: {0}\r\n", fi.LastWriteTimeUtc.ToString("R"));
-            hb.AppendFormat("ETag: \"{0:x}-{1:x}\"\r\n", fi.LastWriteTimeUtc.Ticks, total);
-            hb.Append("Cache-Control: no-store\r\n");
-            hb.Append("Access-Control-Allow-Origin: *\r\n");
-            hb.Append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, X-Stream-Id\r\n");
-            hb.Append("Connection: close\r\n\r\n");
-
-            byte[] headerBytes = Encoding.ASCII.GetBytes(hb.ToString());
-            try { stream.Write(headerBytes, 0, headerBytes.Length); }
-            catch { return; }
-
-            // HEAD 는 헤더만 필요하다.
-            if (isHead) return;
-
-            AccessLogger.Log(clientIp, socketIp, logAction, downloadName, shareId, userAgent,
-                partial
-                    ? string.Format("{0} 중 {1} 이어받기 ({2}~{3}) / {4}",
-                        FormatBytes(total), FormatBytes(length), start, end, logDetail)
-                    : string.Format("{0} / {1}", FormatBytes(total), logDetail));
-
-            long sent = 0;
-            Interlocked.Increment(ref activeTransfers);
-            CtrCipher cipher = encKey != null ? new CtrCipher(encKey, encNonce) : null;
-            try
-            {
-                using (FileStream fs = new FileStream(physicalPath, FileMode.Open, FileAccess.Read,
-                                                      FileShare.ReadWrite | FileShare.Delete,
-                                                      TransferChunkSize,
-                                                      FileOptions.SequentialScan | FileOptions.Asynchronous))
+                StringBuilder hb = new StringBuilder();
+                hb.Append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+                hb.AppendFormat("Content-Type: {0}\r\n", wireType);
+                hb.AppendFormat("Content-Length: {0}\r\n", length);
+                hb.Append("Accept-Ranges: bytes\r\n");
+                if (!isHead && grantToken != null)
                 {
-                    IAsyncResult pending = null;
-                    try
+                    hb.AppendFormat("X-Download-Token: {0}\r\n", grantToken);
+                    hb.AppendFormat("Set-Cookie: {0}={1}; Path=/api/; Max-Age=86400; HttpOnly; SameSite=Strict{2}\r\n",
+                        cookieName, grantToken, encKeyB64 != null ? "; Secure" : "");
+                }
+                if (partial) hb.AppendFormat("Content-Range: bytes {0}-{1}/{2}\r\n", start, end, total);
+                // 헤더에 방식 이름은 싣지 않는다. 클라이언트가 필요로 하는 값만 중립적인 이름으로 준다.
+                if (encKey != null)
+                {
+                    hb.AppendFormat("X-Stream-Id: {0}\r\n", ShareCrypto.ToBase64Url(encNonce));
+                }
+                hb.AppendFormat("Content-Disposition: attachment; filename=\"{0}\"; filename*=UTF-8''{1}\r\n",
+                    MakeHeaderSafeName(wireName), Uri.EscapeDataString(wireName));
+                hb.AppendFormat("Last-Modified: {0}\r\n", fi.LastWriteTimeUtc.ToString("R"));
+                hb.AppendFormat("ETag: \"{0:x}-{1:x}\"\r\n", fi.LastWriteTimeUtc.Ticks, total);
+                hb.Append("Cache-Control: no-store\r\n");
+                hb.Append("Access-Control-Allow-Origin: *\r\n");
+                hb.Append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, X-Stream-Id, X-Download-Token\r\n");
+                hb.Append("Connection: close\r\n\r\n");
+
+                byte[] headerBytes = Encoding.ASCII.GetBytes(hb.ToString());
+                try { stream.Write(headerBytes, 0, headerBytes.Length); }
+                catch { return; }
+
+                // HEAD 는 헤더만 필요하다.
+                if (isHead) return;
+
+                AccessLogger.Log(clientIp, socketIp, logAction, downloadName, shareId, userAgent,
+                    partial
+                        ? string.Format("{0} 중 {1} 이어받기 ({2}~{3}) / {4}",
+                            FormatBytes(total), FormatBytes(length), start, end, logDetail)
+                        : string.Format("{0} / {1}", FormatBytes(total), logDetail));
+
+                long sent = 0;
+                Interlocked.Increment(ref activeTransfers);
+                CtrCipher cipher = encKey != null ? new CtrCipher(encKey, encNonce) : null;
+                try
+                {
                     {
-                        if (start > 0) fs.Seek(start, SeekOrigin.Begin);
-
-                        byte[] cur = new byte[TransferChunkSize];
-                        byte[] nxt = new byte[TransferChunkSize];
-                        long remaining = length;
-
-                        pending = fs.BeginRead(cur, 0, (int)Math.Min(TransferChunkSize, remaining), null, null);
-
-                        while (remaining > 0)
+                        IAsyncResult pending = null;
+                        try
                         {
-                            int n = fs.EndRead(pending);
-                            pending = null;
-                            if (n <= 0) break;
+                            if (start > 0) fs.Seek(start, SeekOrigin.Begin);
 
-                            remaining -= n;
+                            byte[] cur = new byte[TransferChunkSize];
+                            byte[] nxt = new byte[TransferChunkSize];
+                            long remaining = length;
 
-                            // 다음 조각을 디스크에서 미리 읽는 동안 현재 조각을 네트워크로 밀어낸다.
-                            if (remaining > 0)
-                                pending = fs.BeginRead(nxt, 0, (int)Math.Min(TransferChunkSize, remaining), null, null);
+                            pending = fs.BeginRead(cur, 0, (int)Math.Min(TransferChunkSize, remaining), null, null);
 
-                            // 절대 위치를 넘겨 주므로 Range 로 중간부터 시작해도 키스트림이 맞는다.
-                            if (cipher != null) cipher.Xor(start + sent, cur, 0, n);
+                            while (remaining > 0)
+                            {
+                                int n = fs.EndRead(pending);
+                                pending = null;
+                                if (n <= 0) break;
 
-                            stream.Write(cur, 0, n);
-                            sent += n;
+                                remaining -= n;
 
-                            byte[] swap = cur; cur = nxt; nxt = swap;
+                                // 다음 조각을 디스크에서 미리 읽는 동안 현재 조각을 네트워크로 밀어낸다.
+                                if (remaining > 0)
+                                    pending = fs.BeginRead(nxt, 0, (int)Math.Min(TransferChunkSize, remaining), null, null);
+
+                                // 절대 위치를 넘겨 주므로 Range 로 중간부터 시작해도 키스트림이 맞는다.
+                                if (cipher != null) cipher.Xor(start + sent, cur, 0, n);
+
+                                stream.Write(cur, 0, n);
+                                sent += n;
+
+                                byte[] swap = cur; cur = nxt; nxt = swap;
+                            }
+
+                            AccessLogger.Log(clientIp, socketIp, AccessLogger.ActDownDone, downloadName, shareId, userAgent,
+                                string.Format("{0} 전송 완료{1}", FormatBytes(sent), partial ? " (이어받기 구간)" : ""));
                         }
-
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActDownDone, downloadName, shareId, userAgent,
-                            string.Format("{0} 전송 완료{1}", FormatBytes(sent), partial ? " (이어받기 구간)" : ""));
-                    }
-                    catch (Exception ex)
-                    {
-                        AccessLogger.Log(clientIp, socketIp, AccessLogger.ActAborted, downloadName, shareId, userAgent,
-                            string.Format("{0} / {1} 전송 후 중단 — 같은 링크로 이어받기 가능 ({2})",
-                                FormatBytes(sent), FormatBytes(length), ex.Message));
-                    }
-                    finally
-                    {
-                        // 소켓이 먼저 끊겨도 진행 중이던 비동기 읽기는 끝내고 나서 파일 핸들을 닫는다.
-                        if (pending != null) { try { fs.EndRead(pending); } catch { } }
+                        catch (Exception ex)
+                        {
+                            AccessLogger.Log(clientIp, socketIp, AccessLogger.ActAborted, downloadName, shareId, userAgent,
+                                string.Format("{0} / {1} 전송 후 중단 — 같은 링크로 이어받기 가능 ({2})",
+                                    FormatBytes(sent), FormatBytes(length), ex.Message));
+                        }
+                        finally
+                        {
+                            // 소켓이 먼저 끊겨도 진행 중이던 비동기 읽기는 끝내고 나서 파일 핸들을 닫는다.
+                            if (pending != null) { try { fs.EndRead(pending); } catch { } }
+                        }
                     }
                 }
-            }
-            finally
-            {
-                if (cipher != null) cipher.Dispose();
-                Interlocked.Decrement(ref activeTransfers);
+                finally
+                {
+                    if (cipher != null) cipher.Dispose();
+                    Interlocked.Decrement(ref activeTransfers);
+                }
             }
         }
 
-        private static void SendResponse(NetworkStream stream, string status, string contentType, byte[] body)
+        private static void SendResponse(NetworkStream stream, string status, string contentType, byte[] body, bool isHead = false)
         {
-            string headers = string.Format("HTTP/1.1 {0}\r\nContent-Type: {1}\r\nContent-Length: {2}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", status, contentType, body.Length);
+            string headers = string.Format("HTTP/1.1 {0}\r\nContent-Type: {1}\r\nContent-Length: {2}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", status, contentType, body.Length);
             byte[] headerBytes = Encoding.UTF8.GetBytes(headers);
             stream.Write(headerBytes, 0, headerBytes.Length);
-            if (body.Length > 0)
+            if (!isHead && body.Length > 0)
             {
                 stream.Write(body, 0, body.Length);
             }
@@ -5521,7 +5571,7 @@ namespace LocalFileSharer
             sb.Append("<div class='bar' id='bar'><div id='fill'></div></div>");
             sb.Append("<div class='err' id='err'></div>");
             sb.Append("<div class='done' id='done'><div class='mark'>✅</div><div class='msg' id='doneMsg'>다운로드 완료</div><div class='sub' id='doneSub'></div><button class='btn-close' id='btnClose'>창 닫기</button></div>");
-            sb.Append("<div class='note'>받는 도중 연결이 끊기면 자동으로 이어받습니다.<br>큰 파일은 다운로드가 끝날 때까지 이 창을 닫지 마세요.</div>");
+            sb.Append("<div class='note'>ZIP 1건·개별 파일 1개마다 1회 차감합니다. 승인된 이어받기는 추가 차감하지 않습니다.<br>받는 도중 연결이 끊기면 자동으로 이어받습니다.<br>큰 파일은 다운로드가 끝날 때까지 이 창을 닫지 마세요.</div>");
             sb.Append("</div><div id='listWrap'></div></div>");
 
             // ---- 페이지가 쓰는 값들 (이름은 여기 없다. 암호문 안에만 있다) ----
@@ -5798,10 +5848,11 @@ function showBlocked(btn, url, name, oldText, total, wasDisk){
 }
 
 async function pump(url, writable, chunks, btn){
-  var written = 0, total = -1, nonce = null, attempt = 0;
+  var written = 0, total = -1, nonce = null, attempt = 0, downloadToken = null;
 
   while (true){
-    var headers = written > 0 ? { 'Range': 'bytes=' + written + '-' } : {};
+    var headers = (written > 0 || downloadToken) ? { 'Range': 'bytes=' + written + '-' } : {};
+    if (downloadToken) headers['X-Download-Token'] = downloadToken;
     var resp;
 
     try {
@@ -5813,6 +5864,8 @@ async function pump(url, writable, chunks, btn){
     }
 
     if (resp.status !== 200 && resp.status !== 206) throw new Error('서버 응답 ' + resp.status);
+
+    downloadToken = resp.headers.get('X-Download-Token') || downloadToken;
 
     if (nonce === null){
       var nb = resp.headers.get('X-Stream-Id');
@@ -5958,6 +6011,7 @@ boot();
             sb.Append(".btn-sub { background:rgba(6,182,212,0.15); color:#06b6d4; border:1px solid rgba(6,182,212,0.3); padding:0.3rem 0.7rem; border-radius:8px; text-decoration:none; font-size:0.8rem; font-weight:bold; }");
             sb.Append("</style></head><body><div class='container'>");
 
+            sb.Append("<p class='meta'>ZIP 1건·개별 파일 1개마다 1회 차감합니다. 승인된 이어받기는 추가 차감하지 않습니다.</p>");
             string pinQueryParam = !string.IsNullOrEmpty(pin) ? "?pin=" + HttpUtility.UrlEncode(pin) : "";
 
             if (item.IsFolder)
